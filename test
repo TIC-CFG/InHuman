@@ -1,15 +1,20 @@
 import requests
 import json
 import time
+import hashlib
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
-from tqdm import tqdm  # ✅ Progress bar
+from tqdm import tqdm
+import os
 
-# Set your VirusTotal API key here
+# Set your VirusTotal API key
 API_KEY = '71299b55577e69afeaf0177e6ce4fc88c8309a0ff2aacc7c30c4ad82c052e9c6'
 HEADERS = {'x-apikey': API_KEY}
 
-# IOC type detection function
+# Paths
+IOC_FILE = r'C:\Users\Abc\PycharmProjects\PythonProject\.venv\Scripts\iocs.txt'
+
+# Detect IOC type
 def detect_ioc_type(ioc):
     if '.' in ioc and ':' not in ioc:
         if all(c.isdigit() or c == '.' for c in ioc):
@@ -18,7 +23,7 @@ def detect_ioc_type(ioc):
             return 'url'
         elif '.' in ioc:
             return 'domain'
-    elif len(ioc) in (32, 40, 64):  # md5, sha1, sha256
+    elif len(ioc) in (32, 40, 64):
         return 'file'
     return 'unknown'
 
@@ -37,39 +42,52 @@ def query_virustotal(ioc, ioc_type):
         return response.json()
     return None
 
-# Parse VT response
-def parse_vt_data(ioc, ioc_type, data):
+# Query CIRCL Hash Lookup
+def query_circl_hashlookup(hash_value):
+    for algo in ['md5', 'sha1', 'sha256']:
+        url = f'https://hashlookup.circl.lu/lookup/{algo}/{hash_value}'
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if data:
+                return data
+    return None
+
+# Parse VT response and enrich
+def parse_vt_data(ioc, ioc_type, data, circl_data):
     try:
-        analysis_stats = data['data']['attributes']['last_analysis_stats']
-        analysis_results = data['data']['attributes']['last_analysis_results']
-        total = sum(analysis_stats.values())
-        malicious = analysis_stats.get('malicious', 0)
-        flagged_by_ms = 'Microsoft' in analysis_results and analysis_results['Microsoft']['category'] != 'undetected'
-        ms_result = analysis_results.get('Microsoft', {}).get('result', 'undetected')
+        stats = data['data']['attributes']['last_analysis_stats']
+        results = data['data']['attributes']['last_analysis_results']
+        flagged_by_ms = 'Microsoft' in results and results['Microsoft']['category'] != 'undetected'
+        ms_result = results.get('Microsoft', {}).get('result', 'undetected')
+        circl_info = 'Yes' if circl_data else 'No'
+
         return {
             'IOC': ioc,
             'Type': ioc_type,
-            'Total Engines': total,
-            'Malicious': malicious,
-            'Suspicious': analysis_stats.get('suspicious', 0),
-            'Harmless': analysis_stats.get('harmless', 0),
-            'Undetected': analysis_stats.get('undetected', 0),
+            'Total Engines': sum(stats.values()),
+            'Malicious': stats.get('malicious', 0),
+            'Suspicious': stats.get('suspicious', 0),
+            'Harmless': stats.get('harmless', 0),
+            'Undetected': stats.get('undetected', 0),
             'Microsoft Detection': ms_result,
             'Flagged by Microsoft': 'Yes' if flagged_by_ms else 'No',
+            'In CIRCL Dataset': circl_info
         }
     except KeyError:
         return {
             'IOC': ioc,
             'Type': ioc_type,
-            'Error': 'Unable to parse data'
+            'Error': 'Unable to parse data',
+            'In CIRCL Dataset': 'No'
         }
 
-# Read IOCs from file
+# Read IOCs
 def read_iocs_from_file(filename):
     with open(filename, 'r') as file:
         return [line.strip() for line in file if line.strip()]
 
-# Write results to Excel
+# Write Excel report
 def write_to_excel(results, output_file='virustotal_results.xlsx'):
     wb = Workbook()
     ws = wb.active
@@ -79,34 +97,48 @@ def write_to_excel(results, output_file='virustotal_results.xlsx'):
     ws.append(headers)
 
     red_fill = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
+    green_fill = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
 
     for result in results:
-        row = [result.get(header, '') for header in headers]
+        row = [result.get(h, '') for h in headers]
         ws.append(row)
+        last_row = ws.max_row
         if result.get('Flagged by Microsoft') == 'Yes':
-            for cell in ws[ws.max_row]:
+            for cell in ws[last_row]:
                 cell.fill = red_fill
+        elif result.get('In CIRCL Dataset') == 'Yes':
+            for cell in ws[last_row]:
+                cell.fill = green_fill
 
     wb.save(output_file)
 
-# Main function with progress bar
+# Main
 def main():
-    iocs = read_iocs_from_file(r'C:\Users\Abc\PycharmProjects\PythonProject\.venv\Scripts\iocs.txt')
+    iocs = read_iocs_from_file(IOC_FILE)
     results = []
-    print("Checking IOCs on VirusTotal...\n")
-    for ioc in tqdm(iocs, desc="Processing IOCs", unit="IOC"):
+
+    print("\n🔍 Checking IOCs on VirusTotal and CIRCL Hash Lookup...\n")
+    for ioc in tqdm(iocs, desc="🔍 Processing IOCs", unit="IOC"):
         ioc_type = detect_ioc_type(ioc)
-        data = query_virustotal(ioc, ioc_type)
-        if data:
-            parsed = parse_vt_data(ioc, ioc_type, data)
-            results.append(parsed)
+        vt_data = query_virustotal(ioc, ioc_type)
+        time.sleep(15)  # VT public API rate limit
+
+        circl_data = query_circl_hashlookup(ioc) if ioc_type == 'file' else None
+
+        if vt_data:
+            parsed = parse_vt_data(ioc, ioc_type, vt_data, circl_data)
         else:
-            results.append({'IOC': ioc, 'Type': ioc_type, 'Error': 'No data found'})
-        time.sleep(15)  # Respect VT public API rate limit
+            parsed = {
+                'IOC': ioc,
+                'Type': ioc_type,
+                'Error': 'No data found',
+                'In CIRCL Dataset': 'Yes' if circl_data else 'No'
+            }
+
+        results.append(parsed)
 
     write_to_excel(results)
-    print("\n✅ Results written to 'virustotal_results.xlsx'.")
+    print("\n✅ Done! Results saved to 'virustotal_results.xlsx'")
 
 if __name__ == '__main__':
     main()
- 
